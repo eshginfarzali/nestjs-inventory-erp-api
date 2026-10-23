@@ -1,0 +1,236 @@
+// Inventory & production ERP data model.
+// Quantities are whole units (Int). Every stock change is recorded as an
+// immutable StockMovement; StockLevel is the per-product, per-warehouse
+// running balance that the movements maintain inside one DB transaction.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "cjs"
+  importFileExtension = ""
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  OPERATOR
+}
+
+enum MovementType {
+  IN
+  OUT
+  TRANSFER
+  ADJUSTMENT
+}
+
+enum ProductionOrderStatus {
+  PLANNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum NotificationType {
+  LOW_STOCK
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  fullName     String   @map("full_name")
+  passwordHash String   @map("password_hash")
+  role         Role     @default(OPERATOR)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  refreshTokens    RefreshToken[]
+  stockMovements   StockMovement[]
+  productionOrders ProductionOrder[]
+
+  @@map("users")
+}
+
+/// One row per issued refresh token. `id` is the token's `jti`; only a hash of
+/// the token is stored. Tokens issued from the same login share a `familyId`
+/// so that reuse of a rotated token can revoke the whole session.
+model RefreshToken {
+  id           String    @id @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  familyId     String    @map("family_id") @db.Uuid
+  tokenHash    String    @map("token_hash")
+  expiresAt    DateTime  @map("expires_at")
+  revokedAt    DateTime? @map("revoked_at")
+  replacedById String?   @map("replaced_by_id") @db.Uuid
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+model Product {
+  id           String   @id @default(uuid()) @db.Uuid
+  sku          String   @unique
+  name         String
+  description  String?
+  unit         String   @default("pcs")
+  reorderLevel Int      @default(0) @map("reorder_level")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  stockLevels      StockLevel[]
+  movements        StockMovement[]
+  bomItems         BomItem[]                  @relation("BomParent")
+  usedIn           BomItem[]                  @relation("BomComponent")
+  productionOrders ProductionOrder[]
+  orderComponents  ProductionOrderComponent[]
+  notifications    Notification[]
+
+  @@map("products")
+}
+
+/// Bill of materials: `quantity` units of `component` are needed per unit of `product`.
+model BomItem {
+  productId   String @map("product_id") @db.Uuid
+  componentId String @map("component_id") @db.Uuid
+  quantity    Int
+
+  product   Product @relation("BomParent", fields: [productId], references: [id], onDelete: Cascade)
+  component Product @relation("BomComponent", fields: [componentId], references: [id], onDelete: Restrict)
+
+  @@id([productId, componentId])
+  @@index([componentId])
+  @@map("bom_items")
+}
+
+model Warehouse {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  name      String
+  address   String?
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  stockLevels      StockLevel[]
+  movementsOut     StockMovement[]   @relation("MovementFrom")
+  movementsIn      StockMovement[]   @relation("MovementTo")
+  productionOrders ProductionOrder[]
+  notifications    Notification[]
+
+  @@map("warehouses")
+}
+
+/// Running balance per product per warehouse. A CHECK constraint
+/// (see migration) guarantees quantity >= 0 at the database level.
+model StockLevel {
+  productId   String   @map("product_id") @db.Uuid
+  warehouseId String   @map("warehouse_id") @db.Uuid
+  quantity    Int      @default(0)
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  @@id([productId, warehouseId])
+  @@index([warehouseId])
+  @@map("stock_levels")
+}
+
+/// Immutable ledger entry. `quantity` is always positive; stock leaves
+/// `fromWarehouse` and/or arrives in `toWarehouse`:
+///   IN          -> to only
+///   OUT         -> from only
+///   TRANSFER    -> from and to (different warehouses)
+///   ADJUSTMENT  -> to (count up) or from (count down)
+model StockMovement {
+  id                String       @id @default(uuid()) @db.Uuid
+  type              MovementType
+  productId         String       @map("product_id") @db.Uuid
+  fromWarehouseId   String?      @map("from_warehouse_id") @db.Uuid
+  toWarehouseId     String?      @map("to_warehouse_id") @db.Uuid
+  quantity          Int
+  reason            String?
+  reference         String?
+  productionOrderId String?      @map("production_order_id") @db.Uuid
+  createdById       String       @map("created_by_id") @db.Uuid
+  createdAt         DateTime     @default(now()) @map("created_at")
+
+  product         Product          @relation(fields: [productId], references: [id], onDelete: Restrict)
+  fromWarehouse   Warehouse?       @relation("MovementFrom", fields: [fromWarehouseId], references: [id], onDelete: Restrict)
+  toWarehouse     Warehouse?       @relation("MovementTo", fields: [toWarehouseId], references: [id], onDelete: Restrict)
+  productionOrder ProductionOrder? @relation(fields: [productionOrderId], references: [id], onDelete: Restrict)
+  createdBy       User             @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([productId, createdAt])
+  @@index([fromWarehouseId])
+  @@index([toWarehouseId])
+  @@index([productionOrderId])
+  @@map("stock_movements")
+}
+
+model ProductionOrder {
+  id          String                @id @default(uuid()) @db.Uuid
+  number      Int                   @unique @default(autoincrement())
+  productId   String                @map("product_id") @db.Uuid
+  warehouseId String                @map("warehouse_id") @db.Uuid
+  quantity    Int
+  status      ProductionOrderStatus @default(PLANNED)
+  notes       String?
+  createdById String                @map("created_by_id") @db.Uuid
+  startedAt   DateTime?             @map("started_at")
+  completedAt DateTime?             @map("completed_at")
+  cancelledAt DateTime?             @map("cancelled_at")
+  createdAt   DateTime              @default(now()) @map("created_at")
+  updatedAt   DateTime              @updatedAt @map("updated_at")
+
+  product    Product                    @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse  Warehouse                  @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  createdBy  User                       @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  components ProductionOrderComponent[]
+  movements  StockMovement[]
+
+  @@index([status])
+  @@map("production_orders")
+}
+
+/// Snapshot of the BOM taken when the order is created, so later BOM edits
+/// do not change what an existing order consumes.
+model ProductionOrderComponent {
+  orderId         String @map("order_id") @db.Uuid
+  productId       String @map("product_id") @db.Uuid
+  quantityPerUnit Int    @map("quantity_per_unit")
+  totalQuantity   Int    @map("total_quantity")
+
+  order   ProductionOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@id([orderId, productId])
+  @@map("production_order_components")
+}
+
+model Notification {
+  id           String           @id @default(uuid()) @db.Uuid
+  type         NotificationType
+  productId    String           @map("product_id") @db.Uuid
+  warehouseId  String           @map("warehouse_id") @db.Uuid
+  quantity     Int
+  reorderLevel Int              @map("reorder_level")
+  message      String
+  readAt       DateTime?        @map("read_at")
+  createdAt    DateTime         @default(now()) @map("created_at")
+
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@map("notifications")
+}
